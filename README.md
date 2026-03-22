@@ -1,50 +1,71 @@
-# 注意！！！当前模型至少需在4卡A800 80GB上运行，以下步骤基于H系列 or A系列GPU，要求可联网
-# 0.克隆项目
+# Deployment Guide for Seed_add_flashvsr
+
+**Note!!!** The current model requires at least 4 A800 80GB GPUs to run. The following steps are based on H-series or A-series GPUs and require internet access.
+
+
+## 0. Clone the Project
 ```bash
 git clone https://github.com/qiuxiuhao/Seed_add_flashvsr.git
 cd Seed_add_flashvsr
 ```
-# 1.部署SeedVR模型
-# 1.1创建环境
-## 1.1创建基础seedvr环境
-```bash
+
+## 1. Deploy SeedVR Model
+
+### 1.1 Create Environment
+
+#### 1.1.1 Create Basic `seedvr` Environment
+
+```Bash
+
 cd SeedVR/SeedVR
 conda create -n seedvr python=3.10 -y
 conda activate seedvr
 pip install -r requirements.txt
 ```
-## 1.2安装flash_attn
-```bash
+
+#### 1.1.2 Install `flash_attn`
+
+```Bash
+
 pip install flash_attn==2.5.9.post1 --no-build-isolation
-# 如果报错，则需提前下载对应的版本flash_attn,再执行安装本地包
+# If an error occurs, download the corresponding version of flash_attn first, then install the local package
 ```
-## 1.3安装apex
-```bash
-# (1)首先回到SeedVR的上一级目录下
+
+#### 1.1.3 Install `apex`
+
+```Bash
+
+# (1) First return to the parent directory of SeedVR
 cd ..
 
-# (2)克隆 NVIDIA 官方的 apex 仓库(已打包进压缩包)
+# (2) Clone NVIDIA's official apex repository (already included in the compressed package)
 git clone https://github.com/NVIDIA/apex
 
-# (3) 进入 apex 目录
+# (3) Enter the apex directory
 cd apex
 
-# (4) 强制指定编译目标架构
+# (4) Force specify the compilation target architecture
 export TORCH_CUDA_ARCH_LIST="8.0;9.0+PTX"
 
-# 5. 开始编译并安装 (注意：这一步通常需要 5 到 10 分钟，请耐心等待它跑完)
+# (5) Start compiling and installing (Note: This step usually takes 5-10 minutes, please wait patiently)
 pip install -v --disable-pip-version-check --no-cache-dir --no-build-isolation --config-settings "--build-option=--cpp_ext" --config-settings "--build-option=--cuda_ext" ./
 ```
-## 1.4一些补充环境
-```bash
+
+#### 1.1.4 Supplementary Environments
+
+```Bash
+
 cd ../SeedVR
 pip install av
 pip install -r lora_requirements.txt
 pip install -r lora_finetune_requirements.txt
 ```
-# 1.5.下载基础权重SeedVR2-7B
-```bash
-#当前在SeedVR/SeedVR目录
+
+### 1.2 Download Basic Weights: SeedVR2-7B
+
+```Bash
+
+# Currently in the SeedVR/SeedVR directory
 huggingface-cli download ByteDance-Seed/SeedVR2-7B \
   --local-dir ckpts/ \
   --cache-dir ckpts/cache \
@@ -52,14 +73,21 @@ huggingface-cli download ByteDance-Seed/SeedVR2-7B \
   --include "*.json" "*.safetensors" "*.pth" "*.bin" "*.py" "*.md" "*.txt" \
   --exclude "seedvr2_ema_7b_sharp.pth"
 ```
-# 1.6下载lora微调权重
-我们的权重url是：https://drive.google.com/drive/folders/1Vsie9V3f08r0z6Pp3mreVr2EFsJ5yM8z?usp=sharing
-下载完成后，请在请放置在SeedVR/SeedVR/lora_weights/lora.safetensors
 
-# 2.部署flashvsr模型
-## 2.0先回到Seed_add_flashvsr目录下
-## 2.1创建基础的flashvsr环境
-```bash
+### 1.3 Download LoRA Fine-tuning Weights
+
+Our weight URL is:  https://drive.google.com/drive/folders/1Vsie9V3f08r0z6Pp3mreVr2EFsJ5yM8z?usp=sharing
+
+After downloading, please place it in `SeedVR/SeedVR/lora_weights/lora.safetensors`.
+
+## 2. Deploy FlashVSR Model
+
+### 2.0 Return to the `Seed_add_flashvsr` Directory First
+
+### 2.1 Create Basic `flashvsr` Environment
+
+```Bash
+
 cd FlashVSR/FlashVSR
 conda create -n flashvsr python=3.11.13 -y
 conda activate flashvsr
@@ -70,17 +98,23 @@ pip install -r requirements.txt
 pip install modelscope
 cd ..
 ```
-## 2.2安装Block-Sparse-Attention
-```bash
+
+### 2.2 Install Block-Sparse-Attention
+
+```Bash
+
 git clone https://github.com/mit-han-lab/Block-Sparse-Attention
 cd Block-Sparse-Attention
 pip install packaging
 pip install ninja
-python setup.py install #安装过程请保证可以正常clone github仓库的依赖
+python setup.py install # Ensure dependencies from GitHub can be cloned normally during installation
 cd ..
 ```
-# 2.3下载权重
-```bash
+
+### 2.3 Download Weights
+
+```Bash
+
 cd FlashVSR/examples/WanVSR
 
 python -c "
@@ -93,15 +127,25 @@ snapshot_download(
     ignore_patterns=['*.git*', 'README.md']
 )"
 ```
-# 3.推理（SeedVR_add_flashvsr目录下执行）
-## 3.0 test数据需要放在SeedVR_add_flashvsr/test-input-final/test_data
-## 3.1 安装工具
-```bash
+
+## 3. Inference (Execute in the `Seed_add_flashvsr` Directory)
+
+### 3.0 Prepare Test Data
+
+Place test data in `SeedVR_add_flashvsr/test-input-final/test_data`.
+
+### 3.1 Install Tools
+
+```Bash
+
 apt update
 apt install -y ffmpeg
 ```
-## 3.2 推理
-```bash
+
+### 3.2 Run Inference
+
+```Bash
+
 LOCAL=~/SeedVR_add_flashvsr
 REMOTE=root@<SERVER_HOST>:~/autodl-tmp/SeedVR_add_flashvsr
 python run_dual_vsr.py --mode blend --seed-profile lora --flash-profile full_test --alpha 0.7 --input-root test-input-final/test_data --result-root result
