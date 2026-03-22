@@ -1,0 +1,44 @@
+{
+  "seed_profiles": {
+    "base": {
+      "entry_type": "module",
+      "entry": "projects.inference_seedvr2_7b_ours_base",
+      "nproc_per_node": 4,
+      "args": {
+        "sp_size": 4
+      }
+    },
+    "lora": {
+      "entry_type": "module",
+      "entry": "projects.inference_seedvr2_7b_ours_lora",
+      "nproc_per_node": 4,
+      "args": {
+        "lora_path": "lora/lora.safetensors",
+        "sp_size": 4
+      }
+    },
+    "finetuned": {
+      "entry_type": "module",
+      "entry": "projects.inference_seedvr2_7b_ours_finetune",
+      "nproc_per_node": 4,
+      "args": {
+        "adapter_path": "lora/step_00000040",
+        "sp_size": 4
+      }
+    }
+  },
+  "flash_profiles": {
+    "full_test": {
+      "entry": "infer_flashvsr_v1.1_full_test.py",
+      "args": {}
+    },
+    "full_lora": {
+      "entry": "infer_flashvsr_v1.1_full_lora.py",
+      "args": {
+        "lora_ckpt": "",
+        "lora_config": null,
+        "load_lq_proj": true
+      }
+    }
+  }
+}

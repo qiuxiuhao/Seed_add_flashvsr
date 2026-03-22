@@ -1,0 +1,859 @@
+from __future__ import annotations
+
+import argparse
+import contextlib
+import json
+import traceback
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+from einops import rearrange
+from omegaconf import OmegaConf
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+
+try:
+    from tqdm.auto import tqdm
+except Exception:
+    tqdm = None
+
+from common.config import load_config as load_model_config
+from common.diffusion.types import PredictionType
+from projects.video_diffusion_sr.infer import VideoDiffusionInfer
+from rola_finetune.rola import (
+    RotatedLoRAConfig,
+    freeze_non_rola_parameters,
+    get_total_parameter_count,
+    get_trainable_parameter_count,
+    inject_rola_layers,
+    load_adapter,
+    save_adapter,
+)
+from rola_finetune.train.datasets import (
+    SyntheticPairDataset,
+    WildDataset,
+    collect_synthetic_pairs,
+    collect_wild_samples,
+    split_train_holdout,
+)
+from rola_finetune.train.flow import RaftEstimator, raft_temporal_consistency_loss
+from rola_finetune.train.losses import (
+    compute_psnr,
+    compute_supervised_recon_losses,
+    maybe_build_lpips,
+    pointwise_loss,
+    select_decode_frames,
+    simple_degradation,
+    temporal_smooth_loss,
+)
+from rola_finetune.train.utils import (
+    build_condition_latent,
+    build_lr_scheduler,
+    cleanup_distributed,
+    cycle_dataloader,
+    decode_latents_with_grad,
+    enable_runtime_gradient_checkpointing,
+    infer_na_module,
+    init_distributed,
+    prepare_text_embeddings,
+    rank0_print,
+    reduce_mean,
+    reduce_scalar_dict,
+    sample_training_timestep,
+    seed_everything,
+    unwrap_model,
+)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="SeedVR2-7B ROLA finetuning")
+    parser.add_argument("--config", type=str, required=True, help="Path to training yaml")
+    parser.add_argument("--base_ckpt", type=str, default="./ckpts/seedvr2_ema_7b.pth")
+    parser.add_argument("--data_root", type=str, default="./data/train")
+    parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--model_config", type=str, default="configs_7b/main.yaml")
+    parser.add_argument("--pos_emb", type=str, default="pos_emb.pt")
+    parser.add_argument("--resume_adapter", type=str, default="")
+    parser.add_argument("--resume_state", type=str, default="")
+    parser.add_argument("--override", type=str, nargs="*", default=[])
+    return parser.parse_args()
+
+
+def load_train_cfg(path: str, overrides: List[str]) -> Dict:
+    cfg = OmegaConf.load(path)
+    if overrides:
+        dot = OmegaConf.from_dotlist(overrides)
+        cfg = OmegaConf.merge(cfg, dot)
+    return OmegaConf.to_container(cfg, resolve=True)  # type: ignore[return-value]
+
+
+def ddp_wrap(ctx, model: torch.nn.Module, find_unused_parameters: bool) -> torch.nn.Module:
+    if ctx.world_size <= 1:
+        return model
+    return DDP(
+        model,
+        device_ids=[ctx.local_rank],
+        output_device=ctx.local_rank,
+        find_unused_parameters=find_unused_parameters,
+    )
+
+
+def make_loader(dataset, batch_size: int, num_workers: int, pin_memory: bool, train: bool):
+    sampler = None
+    shuffle = train
+    if dist.is_available() and dist.is_initialized():
+        sampler = DistributedSampler(dataset, shuffle=train)
+        shuffle = False
+
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        sampler=sampler,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=False,
+        collate_fn=lambda x: x,
+    )
+    return loader, sampler
+
+
+def build_runner(model_cfg_path: str, base_ckpt: str, enable_runtime_ckpt: bool) -> VideoDiffusionInfer:
+    cfg = load_model_config(model_cfg_path)
+    runner = VideoDiffusionInfer(cfg)
+
+    if enable_runtime_ckpt:
+        enable_runtime_gradient_checkpointing()
+
+    runner.configure_dit_model(device="cuda", checkpoint=base_ckpt)
+    if hasattr(runner.dit, "set_gradient_checkpointing"):
+        runner.dit.set_gradient_checkpointing(enable_runtime_ckpt)
+
+    runner.configure_vae_model()
+    if hasattr(runner.vae, "set_memory_limit") and hasattr(runner.config.vae, "memory_limit"):
+        runner.vae.set_memory_limit(**runner.config.vae.memory_limit)
+    runner.vae.requires_grad_(False).eval()
+
+    runner.configure_diffusion()
+    return runner
+
+
+def build_optimizer(model: torch.nn.Module, stage_cfg: Dict):
+    raw_model = unwrap_model(model)
+    trainable = [p for p in raw_model.parameters() if p.requires_grad]
+    if not trainable:
+        raise RuntimeError("No trainable parameters found after ROLA injection")
+
+    optim = torch.optim.AdamW(
+        trainable,
+        lr=float(stage_cfg["lr"]),
+        betas=(float(stage_cfg["betas"][0]), float(stage_cfg["betas"][1])),
+        weight_decay=float(stage_cfg["weight_decay"]),
+    )
+    sched = build_lr_scheduler(
+        optim,
+        warmup_steps=int(stage_cfg["warmup_steps"]),
+        max_steps=int(stage_cfg["max_steps"]),
+    )
+    return optim, sched
+
+
+def compute_stage1_loss(
+    *,
+    runner: VideoDiffusionInfer,
+    dit_model: torch.nn.Module,
+    na_ops,
+    sample: Dict[str, torch.Tensor],
+    txt_embed: torch.Tensor,
+    txt_shape: torch.Tensor,
+    stage_cfg: Dict,
+    lpips_model: Optional[torch.nn.Module],
+    eval_mode: bool,
+) -> Dict[str, torch.Tensor]:
+    device = txt_embed.device
+    lq = sample["lq"].to(device=device, dtype=torch.bfloat16, non_blocking=True)
+    gt = sample["gt"].to(device=device, dtype=torch.bfloat16, non_blocking=True)
+
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        lq_latent, gt_latent = runner.vae_encode([lq, gt])
+
+    latent_shape = torch.tensor(gt_latent.shape[:-1], device=device, dtype=torch.long).unsqueeze(0)
+
+    if eval_mode:
+        t = torch.tensor([float(runner.schedule.T)], device=device)
+        t = runner.timestep_transform(t, latent_shape)
+    else:
+        t = sample_training_timestep(
+            runner=runner,
+            latent_shape=latent_shape,
+            device=device,
+            loc=float(stage_cfg.get("time_loc", 0.0)),
+            scale=float(stage_cfg.get("time_scale", 1.0)),
+        )
+
+    noise = torch.randn_like(gt_latent)
+    x_t = runner.schedule.forward(gt_latent, noise, t)
+    target_v = noise - gt_latent
+
+    cond_scale = float(stage_cfg.get("cond_noise_scale", -1.0))
+    if cond_scale < 0:
+        cond_scale = float(runner.config.condition.get("noise_scale", 0.0))
+
+    condition = build_condition_latent(
+        runner=runner,
+        lq_latent=lq_latent,
+        latent_shape=latent_shape,
+        cond_noise_scale=cond_scale,
+    )
+
+    x_t_flat, vid_shape = na_ops.flatten([x_t])
+    cond_flat, _ = na_ops.flatten([condition])
+    target_v_flat, _ = na_ops.flatten([target_v])
+
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        pred_v = dit_model(
+            vid=torch.cat([x_t_flat, cond_flat], dim=-1),
+            txt=txt_embed,
+            vid_shape=vid_shape,
+            txt_shape=txt_shape,
+            timestep=t,
+        ).vid_sample
+        loss_v = F.mse_loss(pred_v.float(), target_v_flat.float())
+
+    need_recon = (
+        eval_mode
+        or float(stage_cfg.get("w_l1", 0.0)) > 0.0
+        or float(stage_cfg.get("w_ssim", 0.0)) > 0.0
+        or float(stage_cfg.get("w_lpips", 0.0)) > 0.0
+    )
+
+    zero = torch.zeros((), device=device, dtype=torch.float32)
+    if not need_recon:
+        loss_l1 = zero
+        loss_ssim = zero
+        loss_lpips = zero
+        metric_ssim = zero
+        metric_lpips = zero
+        psnr = zero
+    else:
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            pred_x0_flat, _ = runner.schedule.convert_from_pred(
+                pred=pred_v,
+                pred_type=PredictionType.v_lerp,
+                x_t=x_t_flat,
+                t=t,
+            )
+            pred_x0 = na_ops.unflatten(pred_x0_flat, vid_shape)[0]
+            pred_dec = decode_latents_with_grad(runner, [pred_x0])[0]
+
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            gt_dec = runner.vae_decode([gt_latent])[0]
+
+        pred_frames = rearrange(pred_dec, "c t h w -> t c h w").clamp(-1, 1)
+        gt_frames = rearrange(gt_dec, "c t h w -> t c h w").clamp(-1, 1)
+
+        recon = compute_supervised_recon_losses(
+            pred_frames,
+            gt_frames,
+            lpips_model=lpips_model,
+            frame_cap=int(stage_cfg.get("decode_frame_cap", 0)),
+            pixel_loss_type=str(stage_cfg.get("pixel_loss_type", "l1")),
+            pixel_eps=float(stage_cfg.get("pixel_eps", 1.0e-3)),
+            pixel_delta=float(stage_cfg.get("pixel_delta", 0.05)),
+        )
+
+        eval_pred, eval_gt = select_decode_frames(
+            pred_frames.detach(),
+            gt_frames.detach(),
+            int(stage_cfg.get("decode_frame_cap", 0)),
+        )
+        psnr = compute_psnr(eval_pred, eval_gt, data_range=2.0)
+
+        loss_l1 = recon.loss_l1
+        loss_ssim = recon.loss_ssim
+        loss_lpips = recon.loss_lpips
+        metric_ssim = recon.metric_ssim
+        metric_lpips = recon.metric_lpips
+
+    total = (
+        float(stage_cfg.get("w_v", 1.0)) * loss_v
+        + float(stage_cfg.get("w_l1", 0.0)) * loss_l1
+        + float(stage_cfg.get("w_ssim", 0.0)) * loss_ssim
+        + float(stage_cfg.get("w_lpips", 0.0)) * loss_lpips
+    )
+
+    return {
+        "total": total,
+        "loss_v": loss_v.detach(),
+        "loss_l1": loss_l1.detach(),
+        "loss_ssim": loss_ssim.detach(),
+        "loss_lpips": loss_lpips.detach(),
+        "psnr": psnr.detach(),
+        "ssim": metric_ssim.detach(),
+        "lpips": metric_lpips.detach(),
+    }
+
+
+def compute_stage2_loss(
+    *,
+    runner: VideoDiffusionInfer,
+    dit_model: torch.nn.Module,
+    na_ops,
+    sample: Dict[str, torch.Tensor],
+    txt_embed: torch.Tensor,
+    txt_shape: torch.Tensor,
+    stage_cfg: Dict,
+    raft_estimator: Optional[RaftEstimator],
+) -> Dict[str, torch.Tensor]:
+    device = txt_embed.device
+    lq = sample["lq"].to(device=device, dtype=torch.bfloat16, non_blocking=True)
+
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        lq_latent = runner.vae_encode([lq])[0]
+
+    latent_shape = torch.tensor(lq_latent.shape[:-1], device=device, dtype=torch.long).unsqueeze(0)
+    t = sample_training_timestep(
+        runner=runner,
+        latent_shape=latent_shape,
+        device=device,
+        loc=float(stage_cfg.get("time_loc", 0.0)),
+        scale=float(stage_cfg.get("time_scale", 1.0)),
+    )
+
+    noise = torch.randn_like(lq_latent)
+    x_t = runner.schedule.forward(lq_latent, noise, t)
+
+    cond_scale = float(stage_cfg.get("cond_noise_scale", -1.0))
+    if cond_scale < 0:
+        cond_scale = float(runner.config.condition.get("noise_scale", 0.0))
+
+    condition = build_condition_latent(
+        runner=runner,
+        lq_latent=lq_latent,
+        latent_shape=latent_shape,
+        cond_noise_scale=cond_scale,
+    )
+
+    x_t_flat, vid_shape = na_ops.flatten([x_t])
+    cond_flat, _ = na_ops.flatten([condition])
+
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        pred_v = dit_model(
+            vid=torch.cat([x_t_flat, cond_flat], dim=-1),
+            txt=txt_embed,
+            vid_shape=vid_shape,
+            txt_shape=txt_shape,
+            timestep=t,
+        ).vid_sample
+        pred_x0_flat, _ = runner.schedule.convert_from_pred(
+            pred=pred_v,
+            pred_type=PredictionType.v_lerp,
+            x_t=x_t_flat,
+            t=t,
+        )
+        pred_x0 = na_ops.unflatten(pred_x0_flat, vid_shape)[0]
+        pred_dec = decode_latents_with_grad(runner, [pred_x0])[0]
+
+    pred_frames = rearrange(pred_dec, "c t h w -> t c h w").clamp(-1, 1)
+    lq_frames = rearrange(lq, "c t h w -> t c h w").clamp(-1, 1)
+
+    pred_frames, lq_frames = select_decode_frames(
+        pred_frames,
+        lq_frames,
+        int(stage_cfg.get("decode_frame_cap", 0)),
+    )
+
+    deg_pred = simple_degradation(pred_frames, downscale=int(stage_cfg["deg_downscale"]))
+    loss_deg = pointwise_loss(
+        deg_pred,
+        lq_frames,
+        loss_type=str(stage_cfg["pixel_loss_type"]),
+        eps=float(stage_cfg["pixel_eps"]),
+        delta=float(stage_cfg["pixel_delta"]),
+    )
+
+    if float(stage_cfg["w_temp_raft"]) > 0.0 and raft_estimator is not None and raft_estimator.available:
+        loss_temp = raft_temporal_consistency_loss(pred_frames, lq_frames, raft_estimator)
+    else:
+        loss_temp = torch.zeros((), device=device, dtype=torch.float32)
+
+    loss_smooth = temporal_smooth_loss(pred_frames, loss_type="charbonnier")
+
+    total = (
+        float(stage_cfg["w_deg"]) * loss_deg
+        + float(stage_cfg["w_temp_raft"]) * loss_temp
+        + float(stage_cfg["w_smooth"]) * loss_smooth
+    )
+
+    return {
+        "total": total,
+        "loss_deg": loss_deg.detach(),
+        "loss_temp": loss_temp.detach(),
+        "loss_smooth": loss_smooth.detach(),
+    }
+
+
+@torch.no_grad()
+def evaluate_synthetic_holdout(
+    *,
+    ctx,
+    runner,
+    model,
+    na_ops,
+    val_loader,
+    txt_embed,
+    txt_shape,
+    stage_cfg,
+    lpips_model,
+) -> Dict[str, float]:
+    raw = unwrap_model(model)
+    was_training = raw.training
+    raw.eval()
+
+    sums = {"psnr": 0.0, "ssim": 0.0, "lpips": 0.0}
+    count = 0.0
+    max_batches = int(stage_cfg.get("eval_max_batches", 0))
+
+    for i, batch in enumerate(val_loader):
+        for sample in batch:
+            out = compute_stage1_loss(
+                runner=runner,
+                dit_model=raw,
+                na_ops=na_ops,
+                sample=sample,
+                txt_embed=txt_embed,
+                txt_shape=txt_shape,
+                stage_cfg=stage_cfg,
+                lpips_model=lpips_model,
+                eval_mode=True,
+            )
+            sums["psnr"] += float(out["psnr"].item())
+            sums["ssim"] += float(out["ssim"].item())
+            sums["lpips"] += float(out["lpips"].item())
+            count += 1.0
+
+        if max_batches > 0 and (i + 1) >= max_batches:
+            break
+
+    metrics = {}
+    for k in sums.keys():
+        val = sums[k] / max(1.0, count)
+        metrics[k] = val
+
+    metrics = reduce_scalar_dict(metrics, ctx.device)
+
+    if was_training:
+        raw.train()
+
+    return metrics
+
+
+def save_train_state(
+    output_dir: Path,
+    stage_name: str,
+    step: int,
+    model,
+    optimizer,
+    scheduler,
+    rola_cfg: RotatedLoRAConfig,
+    target_keywords,
+    target_scopes,
+    extra: Dict,
+):
+    ckpt_dir = output_dir / "checkpoints" / stage_name / f"step_{step:08d}"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    raw = unwrap_model(model)
+    save_adapter(
+        str(ckpt_dir),
+        raw,
+        rola_config=rola_cfg,
+        target_keywords=target_keywords,
+        target_scopes=target_scopes,
+        step=step,
+        extra=extra,
+    )
+
+    state = {
+        "stage_name": stage_name,
+        "step": step,
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "extra": extra,
+    }
+    torch.save(state, ckpt_dir / "train_state.pt")
+
+
+def main() -> None:
+    args = parse_args()
+    train_cfg = load_train_cfg(args.config, args.override)
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    ctx = init_distributed(timeout_sec=int(train_cfg.get("dist_timeout_sec", 1800)))
+    seed_everything(int(train_cfg.get("seed", 42)), ctx.rank)
+
+    try:
+        rank0_print(ctx, f"[Config] {json.dumps(train_cfg, ensure_ascii=False, indent=2)}")
+
+        runner = build_runner(
+            model_cfg_path=args.model_config,
+            base_ckpt=args.base_ckpt,
+            enable_runtime_ckpt=bool(train_cfg.get("runtime_checkpointing", True)),
+        )
+        na_ops = infer_na_module(runner.config)
+
+        rola_block = train_cfg.get("rola", {})
+        rola_cfg = RotatedLoRAConfig(
+            rank=int(rola_block.get("rank", 16)),
+            alpha=float(rola_block.get("alpha", 32.0)),
+            dropout=float(rola_block.get("dropout", 0.05)),
+        )
+        target_keywords = tuple(rola_block.get("target_keywords", ["proj_qkv", "proj_out", "proj_in"]))
+        target_scopes = tuple(rola_block.get("target_scopes", ["attn", "mlp"]))
+
+        replaced = inject_rola_layers(
+            runner.dit,
+            rank=rola_cfg.rank,
+            alpha=rola_cfg.alpha,
+            dropout=rola_cfg.dropout,
+            target_keywords=target_keywords,
+            target_scopes=target_scopes,
+        )
+        if len(replaced) == 0:
+            raise RuntimeError("No layers were wrapped by ROLA. Check target_keywords/target_scopes.")
+
+        freeze_non_rola_parameters(runner.dit)
+
+        if args.resume_adapter:
+            cfg_loaded = load_adapter(args.resume_adapter, runner.dit, strict=False)
+            rank0_print(ctx, f"[ResumeAdapter] loaded from {args.resume_adapter}, cfg={cfg_loaded}")
+
+        runner.dit.to(ctx.device)
+        model = ddp_wrap(
+            ctx,
+            runner.dit,
+            find_unused_parameters=bool(train_cfg.get("ddp_find_unused_parameters", True)),
+        )
+
+        raw_model = unwrap_model(model)
+        rank0_print(
+            ctx,
+            f"[Params] total={get_total_parameter_count(raw_model):,} trainable={get_trainable_parameter_count(raw_model):,} wrapped={len(replaced)}",
+        )
+
+        txt_embed, txt_shape = prepare_text_embeddings(na_ops, args.pos_emb, ctx.device)
+
+        data_root = args.data_root
+        synthetic_all = collect_synthetic_pairs(data_root)
+        syn_train_samples, syn_holdout_samples = split_train_holdout(
+            synthetic_all,
+            holdout_ratio=float(train_cfg.get("holdout_ratio", 0.1)),
+            seed=int(train_cfg.get("seed", 42)),
+        )
+        wild_samples = collect_wild_samples(data_root)
+
+        num_workers = int(train_cfg.get("num_workers", 4))
+        pin_memory = bool(train_cfg.get("pin_memory", True))
+        progress_bar = bool(train_cfg.get("progress_bar", True))
+
+        stages_cfg = train_cfg.get("stages", {})
+        stage_order = train_cfg.get("stage_order", ["stage1", "stage2"])
+
+        for stage_name in stage_order:
+            stage_cfg = stages_cfg.get(stage_name, {})
+            if not stage_cfg or (not bool(stage_cfg.get("enabled", True))):
+                continue
+
+            rank0_print(ctx, f"\n[Stage] {stage_name} start")
+            stage_type = str(stage_cfg["type"]).lower()
+
+            long_side = int(stage_cfg["long_side"])
+            short_side = int(stage_cfg["short_side"])
+            clip_len = int(stage_cfg["clip_len"])
+            min_clip_len = int(stage_cfg.get("min_clip_len", 3))
+
+            if stage_type == "synthetic":
+                train_ds = SyntheticPairDataset(
+                    syn_train_samples,
+                    clip_len=clip_len,
+                    long_side=long_side,
+                    short_side=short_side,
+                    train=True,
+                )
+                val_ds = SyntheticPairDataset(
+                    syn_holdout_samples,
+                    clip_len=clip_len,
+                    long_side=long_side,
+                    short_side=short_side,
+                    train=False,
+                )
+            elif stage_type == "wild":
+                train_ds = WildDataset(
+                    wild_samples,
+                    clip_len=clip_len,
+                    long_side=long_side,
+                    short_side=short_side,
+                    train=True,
+                )
+                val_ds = SyntheticPairDataset(
+                    syn_holdout_samples,
+                    clip_len=clip_len,
+                    long_side=long_side,
+                    short_side=short_side,
+                    train=False,
+                )
+            else:
+                raise ValueError(f"Unknown stage type: {stage_type}")
+
+            train_loader, train_sampler = make_loader(
+                train_ds,
+                batch_size=int(stage_cfg.get("batch_size", 1)),
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+                train=True,
+            )
+            val_loader, val_sampler = make_loader(
+                val_ds,
+                batch_size=1,
+                num_workers=max(1, num_workers // 2),
+                pin_memory=pin_memory,
+                train=False,
+            )
+            _ = val_sampler
+
+            optimizer, scheduler = build_optimizer(model, stage_cfg)
+
+            start_step = 0
+            if args.resume_state and Path(args.resume_state).exists():
+                state = torch.load(args.resume_state, map_location="cpu")
+                if str(state.get("stage_name", "")) == stage_name:
+                    optimizer.load_state_dict(state["optimizer"])
+                    scheduler.load_state_dict(state["scheduler"])
+                    start_step = int(state.get("step", 0))
+                    rank0_print(ctx, f"[ResumeState] stage={stage_name} step={start_step}")
+
+            lpips_model = None
+            if stage_type == "synthetic" and float(stage_cfg.get("w_lpips", 0.0)) > 0.0:
+                lpips_model = maybe_build_lpips(ctx.device)
+                if lpips_model is None:
+                    raise RuntimeError("LPIPS requested but library is unavailable. Install lora_requirements.")
+
+            raft_estimator = None
+            if stage_type == "wild" and float(stage_cfg.get("w_temp_raft", 0.0)) > 0.0:
+                raft_estimator = RaftEstimator(ctx.device, ckpt_path=stage_cfg.get("raft_ckpt", ""))
+                if not raft_estimator.available:
+                    rank0_print(ctx, "[WARN] RAFT unavailable, temporal raft loss becomes zero")
+
+            grad_accum = int(stage_cfg.get("grad_accum", 1))
+            max_steps = int(stage_cfg.get("max_steps", 1000))
+            log_every = int(stage_cfg.get("log_every", 10))
+            eval_every = int(stage_cfg.get("eval_every", 100))
+            save_every = int(stage_cfg.get("save_every", 100))
+
+            train_iter = cycle_dataloader(train_loader)
+            current_clip_len = clip_len
+            oom_retry_count = 0
+            oom_retry_max_times = int(stage_cfg.get("oom_retry_max_times", 8))
+
+            raw_model.train()
+            stage_pbar = None
+            if ctx.is_main and progress_bar:
+                if tqdm is None:
+                    rank0_print(ctx, "[WARN] tqdm unavailable, progress bar disabled")
+                else:
+                    stage_pbar = tqdm(
+                        total=max_steps,
+                        initial=start_step,
+                        desc=f"{stage_name}",
+                        dynamic_ncols=True,
+                        leave=True,
+                    )
+            for step in range(start_step, max_steps):
+                if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
+                    train_sampler.set_epoch(step)
+
+                optimizer.zero_grad(set_to_none=True)
+                accum_logs: Dict[str, float] = {}
+
+                micro = 0
+                while micro < grad_accum:
+                    batch = next(train_iter)
+                    sample = batch[0]
+
+                    no_sync = (
+                        isinstance(model, DDP)
+                        and ((micro + 1) % grad_accum != 0)
+                    )
+                    sync_ctx = model.no_sync() if no_sync else contextlib.nullcontext()
+
+                    try:
+                        with sync_ctx:
+                            if stage_type == "synthetic":
+                                out = compute_stage1_loss(
+                                    runner=runner,
+                                    dit_model=model,
+                                    na_ops=na_ops,
+                                    sample=sample,
+                                    txt_embed=txt_embed,
+                                    txt_shape=txt_shape,
+                                    stage_cfg=stage_cfg,
+                                    lpips_model=lpips_model,
+                                    eval_mode=False,
+                                )
+                            else:
+                                out = compute_stage2_loss(
+                                    runner=runner,
+                                    dit_model=model,
+                                    na_ops=na_ops,
+                                    sample=sample,
+                                    txt_embed=txt_embed,
+                                    txt_shape=txt_shape,
+                                    stage_cfg=stage_cfg,
+                                    raft_estimator=raft_estimator,
+                                )
+
+                            (out["total"] / float(grad_accum)).backward()
+
+                    except RuntimeError as exc:
+                        msg = str(exc).lower()
+                        if "out of memory" in msg:
+                            torch.cuda.empty_cache()
+                            # Backward compatible with old configs where only `oom_retry_once` exists.
+                            # If enabled, we allow multiple clip-length fallbacks up to `oom_retry_max_times`.
+                            can_retry = (
+                                bool(stage_cfg.get("oom_retry_once", True))
+                                and current_clip_len > min_clip_len
+                                and oom_retry_count < max(1, oom_retry_max_times)
+                            )
+                            if can_retry:
+                                prev_clip_len = current_clip_len
+                                current_clip_len = max(min_clip_len, current_clip_len - 2)
+                                if current_clip_len == prev_clip_len:
+                                    raise
+                                train_ds.set_clip_len(current_clip_len)
+                                if hasattr(val_ds, "set_clip_len"):
+                                    val_ds.set_clip_len(current_clip_len)
+                                oom_retry_count += 1
+                                rank0_print(
+                                    ctx,
+                                    f"[OOM] clip_len reduced to {current_clip_len} and retrying "
+                                    f"({oom_retry_count}/{max(1, oom_retry_max_times)})",
+                                )
+                                continue
+                        raise
+
+                    for k, v in out.items():
+                        if k == "total":
+                            continue
+                        accum_logs[k] = accum_logs.get(k, 0.0) + float(v.item()) / float(grad_accum)
+
+                    micro += 1
+
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in raw_model.parameters() if p.requires_grad],
+                    max_norm=float(stage_cfg.get("grad_clip", 1.0)),
+                )
+                optimizer.step()
+                scheduler.step()
+                if stage_pbar is not None:
+                    stage_pbar.update(1)
+
+                if (step + 1) % log_every == 0:
+                    log_tensor = torch.tensor(
+                        [float(accum_logs.get("loss_v", 0.0)), float(accum_logs.get("loss_deg", 0.0))],
+                        device=ctx.device,
+                        dtype=torch.float32,
+                    )
+                    if dist.is_available() and dist.is_initialized():
+                        dist.all_reduce(log_tensor, op=dist.ReduceOp.SUM)
+                        log_tensor /= dist.get_world_size()
+                    rank0_print(
+                        ctx,
+                        f"[Train][{stage_name}] step={step+1}/{max_steps} "
+                        f"loss_v={log_tensor[0].item():.6f} loss_deg={log_tensor[1].item():.6f} "
+                        f"lr={scheduler.get_last_lr()[0]:.2e} clip_len={current_clip_len}",
+                    )
+                    if stage_pbar is not None:
+                        stage_pbar.set_postfix(
+                            loss_v=f"{log_tensor[0].item():.4f}",
+                            loss_deg=f"{log_tensor[1].item():.4f}",
+                            lr=f"{scheduler.get_last_lr()[0]:.2e}",
+                            clip=current_clip_len,
+                        )
+
+                if (step + 1) % eval_every == 0:
+                    metrics = evaluate_synthetic_holdout(
+                        ctx=ctx,
+                        runner=runner,
+                        model=model,
+                        na_ops=na_ops,
+                        val_loader=val_loader,
+                        txt_embed=txt_embed,
+                        txt_shape=txt_shape,
+                        stage_cfg=stage_cfg,
+                        lpips_model=lpips_model,
+                    )
+                    rank0_print(
+                        ctx,
+                        f"[Eval][{stage_name}] step={step+1} PSNR={metrics['psnr']:.4f} SSIM={metrics['ssim']:.4f} LPIPS={metrics['lpips']:.4f}",
+                    )
+
+                if (step + 1) % save_every == 0 and ctx.is_main:
+                    extra = {
+                        "stage": stage_name,
+                        "clip_len": current_clip_len,
+                        "global_step": int(step + 1),
+                    }
+                    save_train_state(
+                        output_dir=output_dir,
+                        stage_name=stage_name,
+                        step=step + 1,
+                        model=model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        rola_cfg=rola_cfg,
+                        target_keywords=target_keywords,
+                        target_scopes=target_scopes,
+                        extra=extra,
+                    )
+
+            if stage_pbar is not None:
+                stage_pbar.close()
+
+            if ctx.is_main:
+                extra = {
+                    "stage": stage_name,
+                    "clip_len": current_clip_len,
+                    "global_step": int(max_steps),
+                }
+                save_train_state(
+                    output_dir=output_dir,
+                    stage_name=stage_name,
+                    step=max_steps,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    rola_cfg=rola_cfg,
+                    target_keywords=target_keywords,
+                    target_scopes=target_scopes,
+                    extra=extra,
+                )
+
+        rank0_print(ctx, "[Done] All enabled stages finished.")
+
+    except Exception:
+        if ctx.is_main:
+            traceback.print_exc()
+        raise
+    finally:
+        cleanup_distributed()
+
+
+if __name__ == "__main__":
+    main()

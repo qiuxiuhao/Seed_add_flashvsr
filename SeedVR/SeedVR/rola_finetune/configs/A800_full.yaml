@@ -1,0 +1,98 @@
+seed: 42
+dist_timeout_sec: 2400
+runtime_checkpointing: true
+ddp_find_unused_parameters: true
+num_workers: 8
+pin_memory: true
+holdout_ratio: 0.10
+
+stage_order: [stage1, stage2]
+
+rola:
+  rank: 16
+  alpha: 32.0
+  dropout: 0.05
+  target_keywords: [proj_qkv, proj_out, proj_in]
+  target_scopes: [attn, mlp]
+
+stages:
+  stage1:
+    enabled: true
+    type: synthetic
+    long_side: 512
+    short_side: 320
+    clip_len: 13
+    min_clip_len: 5
+
+    batch_size: 1
+    grad_accum: 4
+
+    lr: 8.0e-5
+    betas: [0.9, 0.999]
+    weight_decay: 0.01
+    warmup_steps: 176
+    max_steps: 40
+    grad_clip: 1.0
+
+    time_loc: 0.0
+    time_scale: 1.0
+    cond_noise_scale: -1.0
+
+    pixel_loss_type: l1
+    pixel_eps: 1.0e-3
+    pixel_delta: 0.05
+    decode_frame_cap: 5
+
+    w_v: 1.0
+    w_l1: 0.5
+    w_ssim: 0.2
+    w_lpips: 0.1
+
+    log_every: 1
+    eval_every: 20
+    save_every: 20
+    eval_max_batches: 40
+
+    oom_retry_once: true
+    oom_retry_max_times: 8
+
+  stage2:
+    enabled: true
+    type: wild
+    long_side: 512
+    short_side: 320
+    clip_len: 49
+    min_clip_len: 5
+
+    batch_size: 1
+    grad_accum: 4
+
+    lr: 6.0e-5
+    betas: [0.9, 0.999]
+    weight_decay: 0.01
+    warmup_steps: 48
+    max_steps: 1200
+    grad_clip: 1.0
+
+    time_loc: 0.0
+    time_scale: 1.0
+    cond_noise_scale: -1.0
+
+    pixel_loss_type: l1
+    pixel_eps: 1.0e-3
+    pixel_delta: 0.05
+    decode_frame_cap: 5
+
+    w_deg: 0.6
+    w_temp_raft: 0.3
+    w_smooth: 0.1
+    deg_downscale: 2
+    raft_ckpt: ./ckpts/metrics/raft_small_C_T_V2-01064c6d.pth
+
+    log_every: 1
+    eval_every: 200
+    save_every: 200
+    eval_max_batches: 16
+
+    oom_retry_once: true
+    oom_retry_max_times: 8

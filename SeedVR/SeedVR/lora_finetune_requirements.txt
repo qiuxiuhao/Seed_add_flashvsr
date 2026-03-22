@@ -1,0 +1,25 @@
+# Incremental dependencies for rola_finetune.
+# Recommended install order:
+#   1) pip install -r requirements.txt
+#   2) pip install -r lora_finetune_requirements.txt
+
+# Core stack (keep aligned with project base env)
+torch==2.3.0
+torchvision==0.18.0
+einops==0.7.0
+omegaconf==2.3.0
+numpy>=1.24,<3
+
+# Adapter / training losses
+safetensors>=0.4.3
+pytorch-msssim>=1.0.0
+lpips>=0.1.4
+
+# Blind metric evaluation (MUSIQ)
+pyiqa>=0.1.10
+
+# Video decoding backend for torchvision.io.read_video
+av>=12.0.0
+
+# Progress bar
+tqdm>=4.66.0

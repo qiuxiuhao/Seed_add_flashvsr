@@ -1,0 +1,7 @@
+# Incremental requirements for SeedVR2 LoRA finetuning (do not replace base env)
+accelerate>=0.33.0,<1.0.0
+safetensors>=0.4.3
+lpips>=0.1.4
+pytorch-msssim>=1.0.0
+tensorboard>=2.16.0
+# av>=12.0.0
