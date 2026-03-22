@@ -1,0 +1,8 @@
+test-input-final/
+result/
+FlashVSR/Block-Sparse-Attention/
+FlashVSR/FlashVSR/examples/WanVSR/FlashVSR-v1.1/
+SeedVR/apex/
+SeedVR/SeedVR/ckpts/
+SeedVR/SeedVR/lora_weights/
+SeedVR/SeedVR/flash_attn-2.5.9.post1+cu122torch2.3cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
