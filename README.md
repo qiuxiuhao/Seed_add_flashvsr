@@ -22,7 +22,7 @@ conda create -n seedvr python=3.10 -y
 conda activate seedvr
 pip install -r requirements.txt
 ```
-
+#### If you encounter issues creating a Conda virtual environment, you can find answers at Seed_add_flashvsr/SeedVR/SeedVR/README.md
 #### 1.1.2 Install `flash_attn`
 
 ```Bash
@@ -85,7 +85,7 @@ After downloading, please place it in `SeedVR/SeedVR/lora_weights/lora.safetenso
 ### 2.0 Return to the `Seed_add_flashvsr` Directory First
 
 ### 2.1 Create Basic `flashvsr` Environment
-
+### If you encounter issues creating a Conda virtual environment, you can find answers at Seed_add_flashvsr/FlashVSR/FLASHVSR/README.md
 ```Bash
 
 cd FlashVSR/FlashVSR
